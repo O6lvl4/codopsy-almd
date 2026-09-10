@@ -26,6 +26,9 @@ Options
                   by default, because a partial parse understates every count)
   --max N         exit 1 if any function is more complex than N
   --quiet         say nothing unless something is wrong (for CI)
+  --baseline F    fail on any file worse than F records it; a single --max lets
+                  every other file rot up to it
+  --write-baseline F   record what every file measures now
 """
 
 // Not `Fn`: that is a Rust trait, and the native backend emits the name verbatim.
@@ -123,7 +126,7 @@ fn to_json(r: FileReport) -> String = {
 
 // Everything the flags say, read once. `main` used to do this inline and the
 // ratchet in ci/check.sh caught it the first time a flag was added to it.
-type Args = { paths: List[String], as_json: Bool, incomplete: Bool, quiet: Bool, max_allowed: Int, help: Bool }
+type Args = { paths: List[String], as_json: Bool, incomplete: Bool, quiet: Bool, max_allowed: Int, help: Bool, baseline: String, write_baseline: String }
 
 fn parse_args(argv: List[String]) -> Args = {
   var paths: List[String] = []
@@ -132,6 +135,8 @@ fn parse_args(argv: List[String]) -> Args = {
   var quiet = false
   var max_allowed = -1
   var help = false
+  var baseline = ""
+  var write_baseline = ""
   var i = 0
   while i < list.len(argv) {
     let a = list.get(argv, i) ?? ""
@@ -140,10 +145,12 @@ fn parse_args(argv: List[String]) -> Args = {
     else if a == "--quiet" then quiet = true
     else if a == "--help" or a == "-h" then help = true
     else if a == "--max" then { max_allowed = int.parse(list.get(argv, i + 1) ?? "") ?? -1; i = i + 1 }
+    else if a == "--baseline" then { baseline = list.get(argv, i + 1) ?? ""; i = i + 1 }
+    else if a == "--write-baseline" then { write_baseline = list.get(argv, i + 1) ?? ""; i = i + 1 }
     else list.push(paths, a)
     i = i + 1
   }
-  Args { paths: paths, as_json: as_json, incomplete: incomplete, quiet: quiet, max_allowed: max_allowed, help: help }
+  Args { paths: paths, as_json: as_json, incomplete: incomplete, quiet: quiet, max_allowed: max_allowed, help: help, baseline: baseline, write_baseline: write_baseline }
 }
 
 // Every .almd file under the paths given, analyzed. A file that could not be
@@ -163,6 +170,59 @@ effect fn collect(a: Args) -> Result[(List[FileReport], Bool), String] = {
   ok((reports, failed))
 }
 
+// A single ceiling holds the worst file and lets every other one rot up to it.
+// A baseline is what each file measured when it was written down, so a file
+// that gets worse fails even while the worst file in the repository is
+// untouched. Paths are recorded relative to the working directory so the file
+// is the same on another machine.
+effect fn relative(path: String) -> String = {
+  let cwd = env.cwd() ?? ""
+  string.strip_prefix(path, cwd + "/") ?? path
+}
+
+effect fn baseline_json(reports: List[FileReport]) -> Result[String, String] = {
+  var rows: List[String] = []
+  for r in reports {
+    list.push(rows, "  " + json.stringify(value.str(relative(r.path)!)) + ": " + int.to_string(max_complexity(r.functions)))
+  }
+  ok("{\n" + string.join(rows, ",\n") + "\n}\n")
+}
+
+// Every file worse than the baseline says it was, and every file the baseline
+// has never seen — a new file is recorded, not refused, but it is said out loud.
+effect fn regressions(reports: List[FileReport], path: String) -> Result[List[String], String] = {
+  let text = fs.read_text(path) |> result.map_err((_) => "no baseline at " + path + "; write one with --write-baseline " + path)!
+  let recorded = json.parse(string.trim(text)) |> result.map_err((e) => "baseline at " + path + " is not JSON: " + e)!
+  var out: List[String] = []
+  for r in reports {
+    let rel = relative(r.path)!
+    let now = max_complexity(r.functions)
+    match json.get_int(recorded, rel) {
+      some(was) => if now > was then list.push(out,
+        rel + ": max " + int.to_string(now) + " is worse than the " + int.to_string(was) + " recorded in " + path) else (),
+      none => list.push(out, rel + ": not in " + path + " (max " + int.to_string(now) + "); add it with --write-baseline"),
+    }
+  }
+  ok(out)
+}
+
+// The two gates, and the recording that replaces them. Everything said here
+// goes to stderr, so --quiet leaves exactly the reasons a build failed.
+effect fn gate_failed(a: Args, reports: List[FileReport]) -> Result[Bool, String] = {
+  if a.write_baseline != "" then {
+    fs.write(a.write_baseline, baseline_json(reports)!) |> result.map_err((e) => "could not write " + a.write_baseline + ": " + e)!
+    println("wrote " + a.write_baseline + " with " + int.to_string(list.len(reports)) + " file(s)")
+    ok(false)
+  } else {
+    let over = list.filter(reports, (r) => a.max_allowed >= 0 and max_complexity(r.functions) > a.max_allowed)
+    for r in over { eprintln(r.path + ": max " + int.to_string(max_complexity(r.functions)) + " exceeds --max " + int.to_string(a.max_allowed)) }
+    let worse = if a.baseline == "" then []
+      else match regressions(reports, a.baseline) { ok(w) => w, err(e) => [e] }
+    for w in worse { eprintln(w) }
+    ok(not list.is_empty(over) or not list.is_empty(worse))
+  }
+}
+
 effect fn main() -> Unit = {
   let a = parse_args(env.args())
   if a.help then { println(USAGE); process.exit(0) } else ()
@@ -174,7 +234,5 @@ effect fn main() -> Unit = {
   if a.as_json then println("[" + string.join(list.map(reports, to_json), ",") + "]")
   else if not a.quiet then for r in reports { println(render(r)) } else ()
 
-  let over = list.filter(reports, (r) => a.max_allowed >= 0 and max_complexity(r.functions) > a.max_allowed)
-  for r in over { eprintln(r.path + ": max " + int.to_string(max_complexity(r.functions)) + " exceeds --max " + int.to_string(a.max_allowed)) }
-  process.exit(if failed or not list.is_empty(over) then 1 else 0)
+  process.exit(if failed or gate_failed(a, reports)! then 1 else 0)
 }

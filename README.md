@@ -54,6 +54,26 @@ the Nth symbol, and a count mismatch is reported rather than assumed away.
 | `--json` | machine-readable results |
 | `--incomplete` | grade partially-parsed files, marked as floors |
 | `--max N` | exit 1 if any function is more complex than N |
+| `--baseline F` | exit 1 on any file worse than F records it |
+| `--write-baseline F` | record what every file measures now |
+| `--quiet` | say nothing unless something is wrong |
+
+## Why a baseline rather than a ceiling
+
+A single `--max` holds the worst file and lets every other one rot up to it. In
+a repository whose worst function is 45, a file sitting at 6 can triple without
+the gate saying anything. A baseline records what each file measures now:
+
+```sh
+codopsy-almd --write-baseline .codopsy-almd.json src/
+codopsy-almd --quiet --baseline .codopsy-almd.json src/
+```
+
+```
+src/tree.almd: max 6 is worse than the 5 recorded in .codopsy-almd.json
+```
+
+A file the baseline has never seen is reported too, rather than passing quietly.
 
 ## Status
 
