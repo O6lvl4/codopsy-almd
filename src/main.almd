@@ -1,0 +1,158 @@
+// codopsy-almd — what the structure of an Almide file costs to read,
+// measured from a parse of Almide.
+//
+//   codopsy-almd <file.almd | dir> ...  [--json] [--incomplete] [--max N]
+//
+// A file gramide could not parse completely is reported and not graded. That
+// rule is the whole reason this exists: the numbers that prompted it were read
+// off files an analyzer had only partly parsed, and they were wrong in both
+// directions — a file graded worst of its set was second best once the parse
+// covered it, and another was graded A on a tenth of itself.
+
+import env
+import fs
+import json
+import process
+import self.tree
+
+let USAGE = """
+codopsy-almd — structural complexity for Almide, from gramide's parse
+
+  codopsy-almd <file.almd | dir> ...
+
+Options
+  --json          machine-readable results
+  --incomplete    grade files gramide could not fully parse (they are skipped
+                  by default, because a partial parse understates every count)
+  --max N         exit 1 if any function is more complex than N
+"""
+
+// Not `Fn`: that is a Rust trait, and the native backend emits the name verbatim.
+type FnStat = { name: String, line: Int, complexity: Int }
+type FileReport = { path: String, complete: Bool, lines: Int, functions: List[FnStat], skipped: String }
+
+fn max_complexity(fns: List[FnStat]) -> Int = list.fold(fns, 0, (acc, f) => int.max(acc, f.complexity))
+fn total_complexity(fns: List[FnStat]) -> Int = list.fold(fns, 0, (acc, f) => acc + f.complexity)
+
+effect fn run(command: String) -> Result[String, String] = {
+  let out = fs.create_temp_file("codopsy-almd") |> result.map_err((e) => "temp file: " + e)!
+  let r = process.exec_status_timeout("sh", ["-c", command + " > " + out + " 2>/dev/null"], 30000)!
+  let text = fs.read_text(out) ?? ""
+  let _ = fs.remove(out)
+  if r.code != 0 and string.trim(text) == "" then err("`" + command + "` exited " + int.to_string(r.code))
+  else ok(text)
+}
+
+fn quoted(p: String) -> String = "'" + string.replace(p, "'", "'\\''") + "'"
+
+// Gramide answers both halves: `symbols` says whether the parse covered the
+// file and names the functions in source order; `parse` gives the tree the
+// counts come from. The Nth function_declaration in the tree is the Nth symbol.
+effect fn analyze(path: String) -> Result[FileReport, String] = {
+  // `symbols` exits non-zero and says nothing when the parse did not cover the
+  // file. That failure is the signal, not an error to give up on: the tree is
+  // still recoverable, so the file can be graded on request — it just may not
+  // be graded silently.
+  let sym_text = run("gramide symbols " + quoted(path)) ?? ""
+  let sym = json.parse(string.trim(sym_text)) ?? value.object([])
+  let complete = json.get_bool(sym, "complete") ?? false
+  let lines = if complete then json.get_int(sym, "total_lines") ?? 0
+    else list.len(string.lines(fs.read_text(path) ?? ""))
+  var names: List[(String, Int)] = []
+  for s in (json.get_array(sym, "symbols") ?? []) {
+    if (json.get_string(s, "kind") ?? "") == "function" then
+      list.push(names, (json.get_string(s, "name") ?? "?", json.get_int(s, "start") ?? 0))
+    else ()
+  }
+  let cx = tree.complexities(run("gramide parse " + quoted(path))!)
+  var fns: List[FnStat] = []
+  var i = 0
+  while i < list.len(cx) {
+    // Names come from `symbols`, which says nothing about a file it could not
+    // cover; numbering them is honest where naming them would not be.
+    let (n, l) = list.get(names, i) ?? ("function #" + int.to_string(i + 1), 0)
+    list.push(fns, FnStat { name: n, line: l, complexity: list.get(cx, i) ?? 1 })
+    i = i + 1
+  }
+  // The pairing is positional, so a length mismatch means it cannot be trusted.
+  let skipped = if complete and list.len(cx) != list.len(names)
+    then "gramide reported " + int.to_string(list.len(names)) + " functions and "
+      + int.to_string(list.len(cx)) + " in its tree; they were not paired"
+    else ""
+  ok(FileReport { path: path, complete: complete, lines: lines, functions: fns, skipped: skipped })
+}
+
+effect fn almd_files(root: String) -> Result[List[String], String] = {
+  if not fs.is_dir(root) then ok([root])
+  else {
+    var out: List[String] = []
+    for e in fs.walk(root)! {
+      if string.ends_with(e, ".almd") then list.push(out, e) else ()
+    }
+    ok(list.sort(out))
+  }
+}
+
+fn render(r: FileReport) -> String = {
+  if list.is_empty(r.functions) then r.path + ": no functions, " + int.to_string(r.lines) + " lines"
+  else {
+    let worst = list.filter(r.functions, (f) => f.complexity == max_complexity(r.functions))
+    let name = option.map(list.first(worst), (f) => f.name + (if f.line > 0 then " (L" + int.to_string(f.line) + ")" else "")) ?? "-"
+    r.path + ": max " + int.to_string(max_complexity(r.functions))
+      + " in " + name
+      + ", total " + int.to_string(total_complexity(r.functions))
+      + " over " + int.to_string(list.len(r.functions)) + " function(s), "
+      + int.to_string(r.lines) + " lines"
+      + (if r.complete then "" else "  [PARTIAL PARSE — every count below is a floor]")
+      + (if r.skipped == "" then "" else "\n  warning: " + r.skipped)
+  }
+}
+
+fn to_json(r: FileReport) -> String = {
+  let fns = string.join(list.map(r.functions, (f) =>
+    "{\"name\":" + json.stringify(value.str(f.name)) + ",\"line\":" + int.to_string(f.line)
+      + ",\"complexity\":" + int.to_string(f.complexity) + "}"), ",")
+  "{\"path\":" + json.stringify(value.str(r.path))
+    + ",\"complete\":" + (if r.complete then "true" else "false")
+    + ",\"lines\":" + int.to_string(r.lines)
+    + ",\"max\":" + int.to_string(max_complexity(r.functions))
+    + ",\"total\":" + int.to_string(total_complexity(r.functions))
+    + ",\"functions\":[" + fns + "]}"
+}
+
+effect fn main() -> Unit = {
+  let argv = env.args()
+  var paths: List[String] = []
+  var as_json = false
+  var grade_incomplete = false
+  var max_allowed = -1
+  var i = 0
+  while i < list.len(argv) {
+    let a = list.get(argv, i) ?? ""
+    if a == "--json" then as_json = true
+    else if a == "--incomplete" then grade_incomplete = true
+    else if a == "--max" then { max_allowed = int.parse(list.get(argv, i + 1) ?? "") ?? -1; i = i + 1 }
+    else if a == "--help" or a == "-h" then { println(USAGE); process.exit(0) }
+    else list.push(paths, a)
+    i = i + 1
+  }
+  if list.is_empty(paths) then { println(USAGE); process.exit(1) } else ()
+
+  var reports: List[FileReport] = []
+  var failed = false
+  for p in paths {
+    for f in almd_files(p) ?? [] {
+      match analyze(f) {
+        ok(r) => if r.complete or grade_incomplete then list.push(reports, r)
+                 else { eprintln(f + ": NOT GRADED — gramide could not parse all of it"); failed = true },
+        err(e) => { eprintln(f + ": " + e); failed = true },
+      }
+    }
+  }
+  if as_json then println("[" + string.join(list.map(reports, to_json), ",") + "]")
+  else for r in reports { println(render(r)) }
+
+  let over = list.filter(reports, (r) => max_allowed >= 0 and max_complexity(r.functions) > max_allowed)
+  for r in over { eprintln(r.path + ": max " + int.to_string(max_complexity(r.functions)) + " exceeds --max " + int.to_string(max_allowed)) }
+  process.exit(if failed or not list.is_empty(over) then 1 else 0)
+}

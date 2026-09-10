@@ -1,0 +1,4 @@
+[package]
+name = "codopsy_almd"
+version = "0.1.0"
+edition = "2026"
