@@ -5,8 +5,16 @@ from [gramide](https://github.com/O6lvl4/gramide)'s parse of Almide rather than
 from a grammar written for another language.
 
 ```sh
-almide build
-./codopsy_almd src/
+almide install github.com/O6lvl4/codopsy-almd   # installs as codopsy_almd
+codopsy_almd src/
+```
+
+Almide package names cannot contain a hyphen, so `almide install` names the
+binary `codopsy_almd`. `--name codopsy-almd` installs it under the hyphenated
+name instead; anything checking for it should try both.
+
+```sh
+almide build && ./codopsy_almd src/          # from a checkout
 ```
 
 ```
