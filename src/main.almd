@@ -40,7 +40,7 @@ fn total_complexity(fns: List[FnStat]) -> Int = list.fold(fns, 0, (acc, f) => ac
 
 effect fn run(command: String) -> Result[String, String] = {
   let out = fs.create_temp_file("codopsy-almd") |> result.map_err((e) => "temp file: " + e)!
-  let r = process.exec_status_timeout("sh", ["-c", command + " > " + out + " 2>/dev/null"], 30000)!
+  let r = process.output(process.ProcessCommand { cmd: "sh", args: ["-c", command + " > " + out + " 2>/dev/null"], timeout_ms: 30000 })!
   let text = fs.read_text(out) ?? ""
   let _ = fs.remove(out)
   if r.code != 0 and string.trim(text) == "" then err("`" + command + "` exited " + int.to_string(r.code))
@@ -59,13 +59,13 @@ effect fn analyze(path: String) -> Result[FileReport, String] = {
   // be graded silently.
   let sym_text = run("gramide symbols " + quoted(path)) ?? ""
   let sym = json.parse(string.trim(sym_text)) ?? value.object([])
-  let complete = json.get_bool(sym, "complete") ?? false
-  let lines = if complete then json.get_int(sym, "total_lines") ?? 0
+  let complete = value.get_bool(sym, "complete") ?? false
+  let lines = if complete then value.get_int(sym, "total_lines") ?? 0
     else list.len(string.lines(fs.read_text(path) ?? ""))
   var names: List[(String, Int)] = []
-  for s in (json.get_array(sym, "symbols") ?? []) {
-    if (json.get_string(s, "kind") ?? "") == "function" then
-      list.push(names, (json.get_string(s, "name") ?? "?", json.get_int(s, "start") ?? 0))
+  for s in (value.get_array(sym, "symbols") ?? []) {
+    if (value.get_string(s, "kind") ?? "") == "function" then
+      list.push(names, (value.get_string(s, "name") ?? "?", value.get_int(s, "start") ?? 0))
     else ()
   }
   let cx = tree.complexities(run("gramide parse " + quoted(path))!)
@@ -113,10 +113,10 @@ fn render(r: FileReport) -> String = {
 }
 
 fn to_json(r: FileReport) -> String = {
-  let fns = string.join(list.map(r.functions, (f) =>
-    "{\"name\":" + json.stringify(value.str(f.name)) + ",\"line\":" + int.to_string(f.line)
+  let fns = list.join(list.map(r.functions, (f) =>
+    "{\"name\":" + json.stringify(value.string(f.name)) + ",\"line\":" + int.to_string(f.line)
       + ",\"complexity\":" + int.to_string(f.complexity) + "}"), ",")
-  "{\"path\":" + json.stringify(value.str(r.path))
+  "{\"path\":" + json.stringify(value.string(r.path))
     + ",\"complete\":" + (if r.complete then "true" else "false")
     + ",\"lines\":" + int.to_string(r.lines)
     + ",\"max\":" + int.to_string(max_complexity(r.functions))
@@ -183,9 +183,9 @@ effect fn relative(path: String) -> String = {
 effect fn baseline_json(reports: List[FileReport]) -> Result[String, String] = {
   var rows: List[String] = []
   for r in reports {
-    list.push(rows, "  " + json.stringify(value.str(relative(r.path)!)) + ": " + int.to_string(max_complexity(r.functions)))
+    list.push(rows, "  " + json.stringify(value.string(relative(r.path)!)) + ": " + int.to_string(max_complexity(r.functions)))
   }
-  ok("{\n" + string.join(rows, ",\n") + "\n}\n")
+  ok("{\n" + list.join(rows, ",\n") + "\n}\n")
 }
 
 // Every file worse than the baseline says it was, and every file the baseline
@@ -197,7 +197,7 @@ effect fn regressions(reports: List[FileReport], path: String) -> Result[List[St
   for r in reports {
     let rel = relative(r.path)!
     let now = max_complexity(r.functions)
-    match json.get_int(recorded, rel) {
+    match value.get_int(recorded, rel) {
       some(was) => if now > was then list.push(out,
         rel + ": max " + int.to_string(now) + " is worse than the " + int.to_string(was) + " recorded in " + path) else (),
       none => list.push(out, rel + ": not in " + path + " (max " + int.to_string(now) + "); add it with --write-baseline"),
@@ -210,7 +210,7 @@ effect fn regressions(reports: List[FileReport], path: String) -> Result[List[St
 // goes to stderr, so --quiet leaves exactly the reasons a build failed.
 effect fn gate_failed(a: Args, reports: List[FileReport]) -> Result[Bool, String] = {
   if a.write_baseline != "" then {
-    fs.write(a.write_baseline, baseline_json(reports)!) |> result.map_err((e) => "could not write " + a.write_baseline + ": " + e)!
+    fs.write_text(a.write_baseline, baseline_json(reports)!) |> result.map_err((e) => "could not write " + a.write_baseline + ": " + e)!
     println("wrote " + a.write_baseline + " with " + int.to_string(list.len(reports)) + " file(s)")
     ok(false)
   } else {
@@ -231,7 +231,7 @@ effect fn main() -> Unit = {
 
   // A gate that prints a line per file drowns the reason it failed. With
   // --quiet only the violations below are said.
-  if a.as_json then println("[" + string.join(list.map(reports, to_json), ",") + "]")
+  if a.as_json then println("[" + list.join(list.map(reports, to_json), ",") + "]")
   else if not a.quiet then for r in reports { println(render(r)) } else ()
 
   process.exit(if failed or gate_failed(a, reports)! then 1 else 0)
